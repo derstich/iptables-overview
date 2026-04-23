@@ -1,6 +1,6 @@
 # iptables-overview
 
-Reads `iptables-save` output and displays a clear, color-coded overview of all ingress and egress firewall rules — including NAT/DNAT routing. Available as both a **Python** and a **Bash** script.
+Displays a clear, color-coded overview of all ingress and egress firewall rules — including NAT/DNAT routing. Available in three variants: Python (`iptables-save`), Bash (`iptables-save`), and Python nft-native (`nft -j list ruleset`).
 
 ## Features
 
@@ -13,6 +13,8 @@ Reads `iptables-save` output and displays a clear, color-coded overview of all i
 ---
 
 ## Python version (`iptables_overview.py`)
+
+Reads `iptables-save` output. Best for systems using the iptables frontend (including `iptables-nft`).
 
 ### Requirements
 
@@ -33,6 +35,8 @@ python3 iptables_overview.py -o /tmp/my-server.txt
 
 ## Bash version (`iptables_overview.sh`)
 
+Identical output to the Python version, implemented in Bash.
+
 ### Requirements
 
 - Bash 4+
@@ -51,9 +55,32 @@ bash iptables_overview.sh -o /tmp/my-server.txt
 
 ---
 
+## nft-native Python version (`nft_overview.py`)
+
+Reads rules directly via `sudo nft -j list ruleset` (JSON). Best for systems using native nftables rulesets.
+
+> **Note for iptables-nft systems**: If your system uses `iptables` as a frontend over nftables (check with `iptables --version` — look for `nf_tables`), port matching via `xt multiport` extensions will appear as `(multiport)` since those parameters are opaque in the nft JSON. DNAT destinations are supplemented automatically via `iptables-save -t nat`. For full per-port details on iptables-nft systems, use `iptables_overview.py` instead.
+
+### Requirements
+
+- Python 3.6+
+- `sudo` access to run `nft` and `iptables-save`
+
+### Usage
+
+```bash
+# Run with default output file (nft-overview-<hostname>.txt)
+python3 nft_overview.py
+
+# Specify output file
+python3 nft_overview.py -o /tmp/my-server.txt
+```
+
+---
+
 ## Output structure
 
-Both versions produce identical output:
+`iptables_overview.py` and `iptables_overview.sh` produce identical output:
 
 ```
 iptables Firewall Overview  -  hostname.example.com
@@ -93,9 +120,12 @@ SUMMARY:
   Output written to: iptables-overview-hostname.example.com.txt
 ```
 
+`nft_overview.py` produces the same structure but reads from the nftables JSON backend.
+
 ---
 
 ## Tested on
 
 - Ubuntu 22.04 with Illumio VEN (`ILO-FILTER-*` chains)
 - Docker host with DNAT port forwarding
+- Systems using `iptables-nft` (iptables frontend over nftables backend)
