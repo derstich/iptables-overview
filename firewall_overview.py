@@ -49,7 +49,7 @@ def port_label(p):
     return p
 
 # ── Shared: table layout ──────────────────────────────────────────────────────
-W = [4, 6, 14, 20, 26, 30, 8]
+W = [4, 6, 20, 16, 26, 28, 8]
 TOTAL_W = sum(W) + 2 * (len(W) - 1)
 
 def hdr():
@@ -63,6 +63,14 @@ def fmt_action(action):
     if action == "->DNAT":  return f"{B}{MGT}->DNAT{R}"
     if action == "MASQ":    return f"{B}{MGT}MASQ  {R}"
     return f"{GRY}{str(action):<6}{R}"
+
+def _col(v, w):
+    """Fit string v into exactly w visible characters, truncating with … if needed."""
+    visible = re.sub(r"\x1b\[[0-9;]*m", "", v)
+    if len(visible) > w:
+        v = visible[:w-1] + "…"
+        visible = v
+    return v + " " * (w - len(visible))
 
 def fmt_row(n, r, row_type="rule"):
     dp    = port_label(r.get("dport","")) if r.get("dport") else ""
@@ -80,10 +88,7 @@ def fmt_row(n, r, row_type="rule"):
 
     num_col = f"{GRY}NAT{R}" if row_type == "nat" else str(n)
     vals = [num_col, r.get("proto","any"), src, dst, port, state]
-    line = ""
-    for v, w in zip(vals, W):
-        visible = re.sub(r"\x1b\[[0-9;]*m", "", v)
-        line += v + " " * max(0, w - len(visible)) + "  "
+    line = "  ".join(_col(v, w) for v, w in zip(vals, W)) + "  "
     line += fmt_action(r.get("action",""))
     if r.get("note"):
         nc = MGT if row_type == "nat" else GRY
