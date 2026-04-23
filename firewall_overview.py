@@ -93,6 +93,12 @@ def fmt_row(n, r, row_type="rule"):
     if r.get("note"):
         nc = MGT if row_type == "nat" else GRY
         line += f"\n      {nc}-> {r['note']}{R}"
+    extra_ips = r.get("extra_ips", [])
+    if extra_ips:
+        col_idx = 2 if r.get("ipset_col") != "dst" else 3
+        offset  = sum(W[:col_idx]) + 2 * col_idx
+        for ip in extra_ips:
+            line += f"\n{' ' * offset}{GRY}{ip}{R}"
     return line
 
 def print_section(title, color, rows, direction):
@@ -209,22 +215,21 @@ def ipt_parse_rule(raw_rule, chains, ipsets=None):
     elif target == "":                            action = None
     else:                                         action = "ALLOW"
 
-    # Resolve ipset references (--match-set SETNAME src|dst)
-    note = ""
+    extra_ips = []; ipset_col = ""
     ms = re.search(r"--match-set\s+(\S+)\s+(src|dst)", raw_rule)
     if ms:
         set_name, direction = ms.group(1), ms.group(2)
         ips = ipsets.get(set_name, [])
-        ip_str = ", ".join(ips) if ips else "(empty)"
-        note = f"{direction.upper()} set {set_name}: {ip_str}"
         if direction == "src":
-            src = _ipset_short(set_name)
+            src = ips[0] if ips else "any"
         else:
-            dst = _ipset_short(set_name)
+            dst = ips[0] if ips else "any"
+        extra_ips = ips[1:]
+        ipset_col = direction
 
     return dict(proto=proto, src=src, dst=dst, dport=dport, sport=sport,
                 state=state, iface=iface, neg_iface=False,
-                action=action, note=note, row_type="rule")
+                action=action, note="", extra_ips=extra_ips, ipset_col=ipset_col, row_type="rule")
 
 IPT_SKIP = [
     r"--ctstate\s+(RELATED,ESTABLISHED|UNTRACKED)",
@@ -416,6 +421,29 @@ def run_iptables(raw_text, hostname, outfile, backend_label):
 # nft ENGINE  (reads nft -j list ruleset JSON)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def nft_load_sets(ruleset):
+    """Return {set_name: [ip, ...]} from native nft set elements."""
+    sets = {}
+    for item in ruleset:
+        if "set" in item:
+            s = item["set"]
+            name = s.get("name", "")
+            elems = s.get("elem", [])
+            sets[name] = [str(e) for e in elems if isinstance(e, str)]
+    return sets
+
+def nft_apply_sets(f, nft_sets):
+    """Replace @SETNAME references in src/dst with the actual IPs."""
+    f = dict(f)
+    for col in ("src", "dst"):
+        val = f.get(col, "")
+        if isinstance(val, str) and val.startswith("@"):
+            ips = nft_sets.get(val[1:], [])
+            f[col]        = ips[0] if ips else "any"
+            f["extra_ips"] = ips[1:]
+            f["ipset_col"] = col
+    return f
+
 def nft_load_ipt_dnat():
     """Supplement DNAT destinations from iptables-save (xt DNAT targets are opaque in nft JSON)."""
     try:
@@ -461,7 +489,7 @@ def _fmt_set(val):
 def nft_extract_fields(exprs):
     f = dict(proto="any", src="any", dst="any", dport="", sport="",
              state="", iface="", neg_iface=False, action="", dnat_to="",
-             note="", _xt_conntrack=False)
+             note="", extra_ips=[], ipset_col="", _xt_conntrack=False)
 
     for expr in exprs:
         if not isinstance(expr, dict): continue
@@ -502,7 +530,7 @@ def nft_extract_fields(exprs):
                 if pl.get("protocol") == "ip" and pl.get("field") == "protocol":
                     f["proto"] = str(right)
 
-            # src/dst IP
+            # src/dst IP  (right may be "@SETNAME" for named set lookups)
             if isinstance(left, dict) and "payload" in left:
                 pl = left["payload"]
                 if pl.get("protocol") in ("ip","ip6"):
@@ -511,10 +539,10 @@ def nft_extract_fields(exprs):
                     elif pl.get("field") == "daddr":
                         f["dst"] = str(right) if op == "==" else f"!{right}"
 
-            # interface
+            # interface (iifname/oifname = name match; iif/oif = index match)
             if isinstance(left, dict) and "meta" in left:
                 key = left["meta"].get("key","")
-                if key in ("iifname","oifname"):
+                if key in ("iifname","oifname","iif","oif"):
                     f["iface"] = str(right); f["neg_iface"] = (op == "!=")
 
             # ports
@@ -542,7 +570,7 @@ def nft_should_skip(f):
     if state and all(s.lower() in ("related","established","untracked")
                      for s in re.split(r"[,\s]+", state)):
         return True
-    if f["iface"] and not f["neg_iface"]: return True   # specific iface = lo passthrough
+    if f["iface"] and not f["neg_iface"] and f["iface"] in ("lo","lo0"): return True
     if f.get("_xt_conntrack") and action in ("RETURN","return"): return True
     return False
 
@@ -554,6 +582,7 @@ def nft_chain_final(table, chain, chains, family="ip", seen=None):
     for rule in chains.get(key, []):
         f = nft_extract_fields(rule.get("expr",[]))
         if f["action"] in ("DROP","REJECT"): return "DROP"
+        if f["action"] in ("ACCEPT",):       return "ALLOW"
         if f["action"].startswith(("jump:","goto:")):
             t = f["action"].split(":",1)[1]
             if nft_chain_final(table, t, chains, family, seen.copy()) == "DROP":
@@ -567,15 +596,15 @@ def nft_resolve_action(f, table, chains, family="ip"):
     if action == "->DNAT":            return "->DNAT"
     if action.startswith(("jump:","goto:")):
         t = action.split(":",1)[1]
-        if t.startswith("ILO-FILTER-ACTION-"):
+        if t in NFT_SKIP_CHAINS:           return None
+        if t.startswith("ILO-FILTER-"):
             return nft_chain_final(table, t, chains, family)
-        if t.startswith("ILO-FILTER-"): return None
         return "ALLOW"
     return None
 
-def nft_collect_raw_drops(chains, family="ip"):
+def nft_collect_raw_drops(chains, family="ip", table="raw", chain_name="PREROUTING"):
     rows = []
-    for rule in chains.get((family,"raw","PREROUTING"),[]):
+    for rule in chains.get((family, table, chain_name), []):
         f = nft_extract_fields(rule.get("expr",[]))
         if f["action"] in ("DROP","REJECT"):
             note = "Direct access to Docker container blocked" if f["dst"].startswith("172.") else ""
@@ -609,21 +638,26 @@ def nft_get_effective_chain(chains, table, base, family="ip"):
             if (family, table, t) in chains: return t
     return base
 
-def nft_collect_ingress(chains, policies, family="ip", ipt_dnat_map=None):
-    table = "filter"; rows = []
+def nft_collect_ingress(chains, policies, nft_sets=None, family="ip", table="filter",
+                        input_base="INPUT", raw_base=None, nat_base=None, ipt_dnat_map=None):
+    if nft_sets is None: nft_sets = {}
+    rows = []
 
-    rows.append(separator("Step 1 – raw PREROUTING (before DNAT)"))
-    rows.extend(nft_collect_raw_drops(chains, family))
+    rows.append(separator("Step 1 – RAW PREROUTING (before DNAT)"))
+    if raw_base:
+        rows.extend(nft_collect_raw_drops(chains, family, table, raw_base))
 
-    dnat_rules = nft_collect_dnat(chains, ipt_dnat_map, "nat","PREROUTING", family)
+    nat_tbl = table if nat_base else "nat"
+    nat_chn = nat_base or "PREROUTING"
+    dnat_rules = nft_collect_dnat(chains, ipt_dnat_map, nat_tbl, nat_chn, family)
     dnat_ports = {f["dport"] for f in dnat_rules if f.get("dport")}
-    rows.append(separator("Step 2 – nat PREROUTING (DNAT – before INPUT filter!)"))
+    rows.append(separator("Step 2 – NAT PREROUTING (DNAT – before INPUT filter!)"))
     for f in dnat_rules:
         note = (f"Forwarded to {f['dnat_to']}  –  traffic continues via FORWARD (bypasses INPUT)"
                 if f.get("dnat_to") else "DNAT – traffic continues via FORWARD (bypasses INPUT)")
         rows.append({**f, "dst":"<server>", "row_type":"nat", "note":note})
 
-    input_chain = nft_get_effective_chain(chains, table, "INPUT", family)
+    input_chain = nft_get_effective_chain(chains, table, input_base, family)
     rows.append(separator(f"Step 3 – INPUT filter ({input_chain})"))
     rows.append(static_row("lo interface",        "ALLOW"))
     rows.append(static_row("RELATED,ESTABLISHED", "ALLOW"))
@@ -631,6 +665,7 @@ def nft_collect_ingress(chains, policies, family="ip", ipt_dnat_map=None):
     added_default = False
     for rule in chains.get((family, table, input_chain), []):
         f = nft_extract_fields(rule.get("expr",[]))
+        f = nft_apply_sets(f, nft_sets)
         if nft_should_skip(f): continue
         action = nft_resolve_action(f, table, chains, family)
 
@@ -641,7 +676,7 @@ def nft_collect_ingress(chains, policies, family="ip", ipt_dnat_map=None):
                (not t.startswith("ILO-FILTER-") and (family,table,t) not in chains):
                 pol = nft_chain_final(table, t, chains, family) \
                       if (family,table,t) in chains \
-                      else policies.get((family,table,"INPUT"),"accept").upper()
+                      else policies.get((family,table,input_base),"accept").upper()
                 rows.append(static_row("DEFAULT (no match above)", pol,
                                        "All connections not explicitly covered above"))
                 added_default = True; continue
@@ -654,14 +689,14 @@ def nft_collect_ingress(chains, policies, family="ip", ipt_dnat_map=None):
         rows.append({**f, "action":action, "note":note, "row_type":"rule"})
 
     if not added_default:
-        pol = policies.get((family,table,"INPUT"),"accept").upper()
+        pol = policies.get((family,table,input_base),"accept").upper()
         rows.append(static_row("DEFAULT (no match above)", pol,
                                "All connections not explicitly covered above"))
     return rows, dnat_ports
 
-def nft_collect_egress(chains, policies, family="ip"):
-    table = "filter"
-    output_chain = nft_get_effective_chain(chains, table, "OUTPUT", family)
+def nft_collect_egress(chains, policies, nft_sets=None, family="ip", table="filter", output_base="OUTPUT"):
+    if nft_sets is None: nft_sets = {}
+    output_chain = nft_get_effective_chain(chains, table, output_base, family)
     rows = [separator(f"Step – OUTPUT filter ({output_chain})")]
     rows.append(static_row("lo interface",        "ALLOW"))
     rows.append(static_row("RELATED,ESTABLISHED", "ALLOW"))
@@ -669,6 +704,7 @@ def nft_collect_egress(chains, policies, family="ip"):
     added_default = False
     for rule in chains.get((family, table, output_chain), []):
         f = nft_extract_fields(rule.get("expr",[]))
+        f = nft_apply_sets(f, nft_sets)
         if nft_should_skip(f): continue
         action = nft_resolve_action(f, table, chains, family)
 
@@ -679,7 +715,7 @@ def nft_collect_egress(chains, policies, family="ip"):
                (not t.startswith("ILO-FILTER-") and (family,table,t) not in chains):
                 pol = nft_chain_final(table, t, chains, family) \
                       if (family,table,t) in chains \
-                      else policies.get((family,table,"OUTPUT"),"accept").upper()
+                      else policies.get((family,table,output_base),"accept").upper()
                 rows.append(static_row("DEFAULT (no match above)", pol,
                                        "No explicit DROP for outbound traffic"))
                 added_default = True; continue
@@ -688,7 +724,7 @@ def nft_collect_egress(chains, policies, family="ip"):
         rows.append({**f, "action":action, "note":"", "row_type":"rule"})
 
     if not added_default:
-        pol = policies.get((family,table,"OUTPUT"),"accept").upper()
+        pol = policies.get((family,table,output_base),"accept").upper()
         rows.append(static_row("DEFAULT (no match above)", pol,
                                "No explicit DROP for outbound traffic"))
     return rows
@@ -701,22 +737,42 @@ def run_nft(ruleset, ipt_dnat_map, hostname, outfile, backend_label):
     print(f"{B}{bar}{R}")
 
     chains, policies, hook_chains = nft_build_index(ruleset)
+    nft_sets = nft_load_sets(ruleset)
 
-    print(f"\n{B}Default Policies (table ip filter):{R}")
+    # Detect the family and table that contains the ILO enforcement chains
+    family, ilo_table = "ip", "filter"
+    for c in hook_chains:
+        if "ILO" in c.get("table","") and c.get("hook"):
+            family = c["family"]; ilo_table = c["table"]; break
+
+    def _hook_chain(hook, hint=""):
+        for c in hook_chains:
+            if c["family"]==family and c["table"]==ilo_table and c.get("hook")==hook:
+                if not hint or hint in c["name"]: return c["name"]
+        return None
+
+    input_base  = _hook_chain("input")  or "INPUT"
+    output_base = _hook_chain("output") or "OUTPUT"
+    raw_base    = _hook_chain("prerouting", "RAW")
+    nat_base    = _hook_chain("prerouting", "NAT")
+
+    print(f"\n{B}Default Policies ({family} {ilo_table}):{R}")
     seen_hooks = set()
     for hook in ("input","forward","output"):
         for c in hook_chains:
-            if c["family"] != "ip" or c["table"] != "filter" or c.get("hook") != hook: continue
-            hk = (c["family"], c["table"], hook)
+            if c["family"] != family or c["table"] != ilo_table or c.get("hook") != hook: continue
+            hk = (family, ilo_table, hook)
             if hk in seen_hooks: continue
             seen_hooks.add(hk)
             pol = c.get("policy","accept").upper()
             col = GRN if pol == "ACCEPT" else RED
             print(f"  {c['name']:<12}: {B}{col}{pol}{R}")
 
-    ingress, dnat_ports = nft_collect_ingress(chains, policies, ipt_dnat_map=ipt_dnat_map)
-    egress              = nft_collect_egress(chains, policies)
-    dnat_rules          = nft_collect_dnat(chains, ipt_dnat_map, "nat","PREROUTING")
+    ingress, dnat_ports = nft_collect_ingress(
+        chains, policies, nft_sets, family, ilo_table,
+        input_base, raw_base, nat_base, ipt_dnat_map)
+    egress     = nft_collect_egress(chains, policies, nft_sets, family, ilo_table, output_base)
+    dnat_rules = nft_collect_dnat(chains, ipt_dnat_map, ilo_table, nat_base or "PREROUTING", family)
 
     print_section("INPUT chain",  CYN, ingress, "INGRESS")
     print_section("OUTPUT chain", YEL, egress,  "EGRESS")
