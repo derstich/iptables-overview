@@ -421,6 +421,20 @@ def run_iptables(raw_text, hostname, outfile, backend_label):
 # nft ENGINE  (reads nft -j list ruleset JSON)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def ipt_load_raw_and_dnat():
+    """Load RAW DROP rows and NAT DNAT rows from iptables-save.
+    Used to supplement the nft view when Docker (or similar) uses iptables
+    for raw/nat rules while the main enforcement lives in nftables."""
+    try:
+        r = subprocess.run(["sudo", "iptables-save"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0: return [], []
+        _, _, all_chains = ipt_parse(r.stdout)
+        raw_rows  = ipt_collect_raw(all_chains)
+        dnat_rows = ipt_collect_dnat(all_chains, "nat", "PREROUTING")
+        return raw_rows, dnat_rows
+    except Exception:
+        return [], []
+
 def nft_load_sets(ruleset):
     """Return {set_name: [ip, ...]} from native nft set elements."""
     sets = {}
@@ -639,17 +653,25 @@ def nft_get_effective_chain(chains, table, base, family="ip"):
     return base
 
 def nft_collect_ingress(chains, policies, nft_sets=None, family="ip", table="filter",
-                        input_base="INPUT", raw_base=None, nat_base=None, ipt_dnat_map=None):
+                        input_base="INPUT", raw_base=None, nat_base=None, ipt_dnat_map=None,
+                        extra_raw_rows=None, extra_dnat_rows=None):
     if nft_sets is None: nft_sets = {}
     rows = []
 
     rows.append(separator("Step 1 – RAW PREROUTING (before DNAT)"))
     if raw_base:
         rows.extend(nft_collect_raw_drops(chains, family, table, raw_base))
+    if extra_raw_rows:
+        rows.extend(extra_raw_rows)
 
     nat_tbl = table if nat_base else "nat"
     nat_chn = nat_base or "PREROUTING"
     dnat_rules = nft_collect_dnat(chains, ipt_dnat_map, nat_tbl, nat_chn, family)
+    # Supplement with iptables DNAT rows (e.g. Docker on nftables systems)
+    existing_dports = {r.get("dport") for r in dnat_rules}
+    for r in (extra_dnat_rows or []):
+        if r.get("dport") not in existing_dports:
+            dnat_rules.append(r)
     dnat_ports = {f["dport"] for f in dnat_rules if f.get("dport")}
     rows.append(separator("Step 2 – NAT PREROUTING (DNAT – before INPUT filter!)"))
     for f in dnat_rules:
@@ -768,11 +790,15 @@ def run_nft(ruleset, ipt_dnat_map, hostname, outfile, backend_label):
             col = GRN if pol == "ACCEPT" else RED
             print(f"  {c['name']:<12}: {B}{col}{pol}{R}")
 
+    # Supplement nft view with iptables raw/nat rules (e.g. Docker on nftables systems)
+    ipt_extra_raw, ipt_extra_dnat = ipt_load_raw_and_dnat()
+
     ingress, dnat_ports = nft_collect_ingress(
         chains, policies, nft_sets, family, ilo_table,
-        input_base, raw_base, nat_base, ipt_dnat_map)
+        input_base, raw_base, nat_base, ipt_dnat_map,
+        extra_raw_rows=ipt_extra_raw, extra_dnat_rows=ipt_extra_dnat)
     egress     = nft_collect_egress(chains, policies, nft_sets, family, ilo_table, output_base)
-    dnat_rules = nft_collect_dnat(chains, ipt_dnat_map, ilo_table, nat_base or "PREROUTING", family)
+    dnat_rules = ([r for r in ingress if r.get("action") == "->DNAT"])
 
     print_section("INPUT chain",  CYN, ingress, "INGRESS")
     print_section("OUTPUT chain", YEL, egress,  "EGRESS")
